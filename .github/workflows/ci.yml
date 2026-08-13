@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"   # weekly retrain guard, Mondays 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  quality-checks:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run test suite (data contract, model, gate logic, style gate)
+        run: pytest -q
+
+  train-and-gate:
+    name: Train model and enforce quality gate
+    runs-on: ubuntu-latest
+    needs: quality-checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Train model
+        run: python train.py
+      - name: Quality gate (blocks deployment if the model is weak)
+        run: python gate.py
+      - name: Promote model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: |
+            model.joblib
+            metrics.json
+          retention-days: 30
