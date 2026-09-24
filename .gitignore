@@ -3,5 +3,15 @@ __pycache__/
 .venv/
 model.joblib
 metrics.json
+predictions.json
+data_profile.json
+gate_report.json
+gate_report.md
+drift_report.md
+champion.json
+shifted.csv
 site/
 .pytest_cache/
+.ruff_cache/
+history.json
+index.html

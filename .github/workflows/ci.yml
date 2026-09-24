@@ -18,12 +18,14 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -r requirements.txt
-      - name: Run test suite (data contract, model, gate logic, style gate)
+      - run: pip install -r requirements.txt ruff
+      - name: Lint
+        run: ruff check .
+      - name: Test suite (metrics, gate policy, release scenarios, data contract, style)
         run: pytest -q
 
   train-and-gate:
-    name: Train model and enforce quality gate
+    name: Train model and enforce release gate
     runs-on: ubuntu-latest
     needs: quality-checks
     steps:
@@ -35,8 +37,8 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Train model
         run: python train.py
-      - name: Quality gate (blocks deployment if the model is weak)
-        run: python gate.py
+      - name: Release gate (quality, calibration, slices, fairness, champion, drift)
+        run: python gate.py   # compares against the champion published on the live site
       - name: Promote model artifact
         uses: actions/upload-artifact@v4
         with:
@@ -44,4 +46,43 @@ jobs:
           path: |
             model.joblib
             metrics.json
+            predictions.json
+            data_profile.json
+            gate_report.json
           retention-days: 30
+
+  # The gate is only worth something if it says no. Each step below builds a model or a
+  # batch that must be rejected, and fails the workflow if the gate lets it through.
+  negative-controls:
+    name: Gate must block bad releases
+    runs-on: ubuntu-latest
+    needs: quality-checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Sabotaged model (shuffled labels) must be blocked
+        run: |
+          python train.py --sabotage
+          if python gate.py --champion none; then echo "gate let a sabotaged model through"; exit 1; fi
+      - name: Subtle regression that clears the AUC floor must be blocked by the champion check
+        run: |
+          python train.py && cp predictions.json champion.json
+          python train.py --n-estimators 20 --max-depth 2
+          if python gate.py --champion champion.json; then echo "gate let a regression through"; exit 1; fi
+          python - <<'EOF'
+          import json
+          checks = {c["name"]: c for c in json.load(open("gate_report.json"))["checks"]}
+          assert checks["roc_auc_test"]["passed"], "demo expects the absolute floor to pass"
+          assert not checks["non-inferior to deployed model"]["passed"], "champion check should block"
+          print("regression cleared the floor and was still blocked by the champion check")
+          EOF
+      - name: Drifted batch must be blocked; the training data must not be
+        run: |
+          python train.py
+          python monitor.py data/telco_churn.csv
+          python monitor.py --make-shifted-demo shifted.csv
+          if python monitor.py shifted.csv; then echo "monitor missed a shifted batch"; exit 1; fi

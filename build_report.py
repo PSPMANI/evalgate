@@ -1,21 +1,25 @@
-"""Build the model-quality dashboard that CD publishes to GitHub Pages.
+"""Build the model-quality dashboard and model card that CD publishes to GitHub Pages.
 
     python build_report.py
 
-Reads metrics.json, merges it into the run history fetched from the currently
-published dashboard (stateless history: the site itself is the store), and
-writes a self-contained site/ folder.
+Reads the promoted artifacts (metrics.json, predictions.json, gate_report.json), merges
+the run into the history fetched from the currently published site (stateless history:
+the site itself is the store), and writes a self-contained site/ folder:
+
+  index.html      the dashboard
+  model_card.md   the model card for this exact deployment
+  history.json    every gated deployment so far
+  champion.json   this model's held-out scores: the baseline the NEXT model must match
 """
 import json
 import pathlib
 import urllib.request
+from html import escape
 
 HERE = pathlib.Path(__file__).parent
 SITE = HERE / "site"
 HISTORY_URL = "https://pspmani.github.io/evalgate/history.json"
 MAX_HISTORY = 200
-
-THRESHOLDS = {"roc_auc_test": 0.82, "accuracy_test": 0.75, "roc_auc_cv_mean": 0.82}
 
 
 def fetch_history():
@@ -26,50 +30,143 @@ def fetch_history():
         return []
 
 
-def spark_svg(values, width=560, height=90):
+def spark_svg(values, floor, width=560, height=90):
+    """AUC over deployments on a fixed scale that always includes the gate floor, so a
+    0.0001 platform-rounding wobble does not look like a collapse."""
     if len(values) < 2:
         values = values * 2
-    lo, hi = min(values), max(values)
-    span = (hi - lo) or 1e-9
-    pts = []
-    for i, v in enumerate(values):
-        x = 10 + i * (width - 20) / (len(values) - 1)
-        y = height - 12 - (v - lo) / span * (height - 24)
-        pts.append(f"{x:.1f},{y:.1f}")
-    return (
-        f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}">'
-        f'<polyline fill="none" stroke="#4f46e5" stroke-width="2.5" points="{" ".join(pts)}"/>'
-        "</svg>"
-    )
+    lo, hi = min(min(values), floor) - 0.01, max(values) + 0.01
+
+    def ypos(v):
+        return height - 12 - (v - lo) / (hi - lo) * (height - 24)
+
+    pts = [f"{10 + i * (width - 20) / (len(values) - 1):.1f},{ypos(v):.1f}" for i, v in enumerate(values)]
+    fy = ypos(floor)
+    return (f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}">'
+            f'<line x1="10" y1="{fy:.1f}" x2="{width - 10}" y2="{fy:.1f}" stroke="#dc2626" stroke-dasharray="5 4"/>'
+            f'<text x="{width - 10}" y="{fy - 4:.1f}" font-size="10" text-anchor="end" fill="#dc2626">'
+            f'gate floor {floor}</text>'
+            f'<polyline fill="none" stroke="#4f46e5" stroke-width="2.5" points="{" ".join(pts)}"/></svg>')
+
+
+def reliability_svg(curve, size=260):
+    """Calibration plot: predicted probability (x) vs observed churn rate (y)."""
+    pad = 30
+    inner = size - 2 * pad
+
+    def xy(px, py):
+        return pad + px * inner, size - pad - py * inner
+
+    x0, y0 = xy(0, 0)
+    x1, y1 = xy(1, 1)
+    parts = [f'<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}">',
+             f'<rect x="{pad}" y="{pad}" width="{inner}" height="{inner}" fill="none" stroke="#e5e7eb"/>',
+             f'<line x1="{x0}" y1="{y0}" x2="{x1}" y2="{y1}" stroke="#9ca3af" stroke-dasharray="4 4"/>']
+    pts = [xy(b["mean_pred"], b["observed"]) for b in curve]
+    parts.append('<polyline fill="none" stroke="#4f46e5" stroke-width="2" points="'
+                 + " ".join(f"{x:.1f},{y:.1f}" for x, y in pts) + '"/>')
+    for (x, y), b in zip(pts, curve, strict=True):
+        r = 2.5 + min(6.0, b["n"] ** 0.5 / 4)
+        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" fill="#4f46e5" fill-opacity="0.75">'
+                     f'<title>predicted {b["mean_pred"]:.2f}, observed {b["observed"]:.2f}, n={b["n"]}</title></circle>')
+    parts.append(f'<text x="{size / 2}" y="{size - 6}" font-size="10" text-anchor="middle" fill="#6b7280">predicted</text>')
+    parts.append(f'<text x="10" y="{size / 2}" font-size="10" text-anchor="middle" fill="#6b7280" '
+                 f'transform="rotate(-90 10 {size / 2})">observed</text></svg>')
+    return "".join(parts)
+
+
+def check_rows(checks):
+    out = []
+    for c in checks:
+        cls, label = ("skip", "SKIP") if c["skipped"] else (("ok", "PASS") if c["passed"] else ("bad", "FAIL"))
+        out.append(f"<tr><td>{escape(c['group'])}</td><td>{escape(c['name'])}</td><td>{escape(c['value'])}</td>"
+                   f"<td>{escape(c['requirement'])}</td><td class='{cls}'>{label}</td></tr>")
+    return "".join(out)
+
+
+def model_card(m, gate, history_len):
+    comp = gate.get("champion_comparison")
+    champ = (f"{comp['diff']:+.4f} AUC vs deployed model {comp['champion_sha']} "
+             f"(95% CI {comp['ci'][0]:+.4f} to {comp['ci'][1]:+.4f})") if comp else "first deployment (no champion)"
+    slices = []
+    for col, groups in m["slices"].items():
+        for value, g in groups.items():
+            auc = "n/a" if g["auc"] is None else f"{g['auc']:.4f}"
+            slices.append(f"| {col} | {value} | {g['n']} | {g['base_rate']:.3f} | {auc} |")
+    return f"""# Model card: telco churn classifier ({m['git_sha']})
+
+Generated by the EvalGate CD pipeline for the deployment trained {m['trained_at_utc']} UTC.
+Deployment #{history_len} recorded by the pipeline.
+
+## Intended use
+Rank existing telecom customers by churn risk so a retention team can prioritise
+outreach. Not for pricing, credit or any decision that denies a customer service.
+
+## Data
+IBM Telco Customer Churn (public): {m['n_train'] + m['n_test']:,} customers after removing
+11 rows with missing TotalCharges. Stratified 80/20 split, seed 42: {m['n_train']:,} train,
+{m['n_test']:,} held-out test. 19 features (demographics, account, services).
+
+## Model
+scikit-learn Pipeline: StandardScaler + OneHotEncoder(handle_unknown="ignore") into a
+GradientBoostingClassifier (seed 42).
+
+## Performance (held-out test set)
+- ROC-AUC {m['roc_auc_test']:.4f} (95% bootstrap CI {m['roc_auc_test_ci'][0]:.4f} to {m['roc_auc_test_ci'][1]:.4f})
+- 5-fold CV ROC-AUC {m['roc_auc_cv_mean']:.4f} +/- {m['roc_auc_cv_std']:.4f}
+- Accuracy {m['accuracy_test']:.4f} at threshold 0.5
+- Calibration: Brier {m['brier']:.4f}, ECE {m['ece']:.4f}
+- Versus the previous deployment: {champ}
+
+## Performance by segment
+| Column | Value | n | Churn rate | ROC-AUC |
+|---|---|---|---|---|
+{chr(10).join(slices)}
+
+## Release gate
+{sum(1 for c in gate['checks'] if not c['skipped'])} checks enforced in CI (quality, calibration, every
+segment with n >= 100, fairness gaps on gender and SeniorCitizen, non-inferiority to the deployed
+model, train/test drift). Result: {'PASSED' if gate['passed'] else 'BLOCKED'}. Policy: gate.toml.
+
+## Limitations
+- One public dataset from a single operator and period; the data is static, so the weekly
+  retrain re-validates the pipeline rather than learning from new customers.
+- Segment AUCs on small groups (e.g. senior citizens, n={m['slices'].get('SeniorCitizen', {}).get('1', {}).get('n', 'n/a')}) are noisy.
+- Within a contract type the model separates churners less well (AUC 0.70 to 0.83) than overall,
+  because contract type itself is the strongest signal.
+- Fairness checks cover only the attributes present in the data (gender, SeniorCitizen).
+"""
 
 
 def main():
     metrics = json.loads((HERE / "metrics.json").read_text(encoding="utf-8"))
+    gate = json.loads((HERE / "gate_report.json").read_text(encoding="utf-8"))
+    predictions = json.loads((HERE / "predictions.json").read_text(encoding="utf-8"))
     history = fetch_history()
-    if not any(h.get("git_sha") == metrics["git_sha"]
-               and h.get("trained_at_utc") == metrics["trained_at_utc"] for h in history):
-        history.append(metrics)
+    entry = {k: metrics[k] for k in ("roc_auc_test", "roc_auc_cv_mean", "roc_auc_cv_std", "accuracy_test",
+                                     "git_sha", "trained_at_utc")}
+    entry.update({"ece": metrics["ece"], "brier": metrics["brier"],
+                  "checks": len(gate["checks"]), "failed": sum(not c["passed"] for c in gate["checks"])})
+    if not any(h.get("git_sha") == entry["git_sha"] and h.get("trained_at_utc") == entry["trained_at_utc"]
+               for h in history):
+        history.append(entry)
     history = history[-MAX_HISTORY:]
 
     rows = []
     for m in reversed(history[-25:]):
-        rows.append(
-            "<tr><td>" + m.get("trained_at_utc", "-") + "</td>"
-            "<td><code>" + m.get("git_sha", "-") + "</code></td>"
-            f"<td>{m.get('roc_auc_test', 0):.4f}</td>"
-            f"<td>{m.get('roc_auc_cv_mean', 0):.4f} +/- {m.get('roc_auc_cv_std', 0):.4f}</td>"
-            f"<td>{m.get('accuracy_test', 0):.4f}</td></tr>"
-        )
-    gates = []
-    for key, minimum in THRESHOLDS.items():
-        val = metrics.get(key, 0)
-        ok = val >= minimum
-        gates.append(
-            f"<tr><td>{key}</td><td>{val:.4f}</td><td>&gt;= {minimum}</td>"
-            f"<td class='{'ok' if ok else 'bad'}'>{'PASS' if ok else 'FAIL'}</td></tr>"
-        )
+        cal = f"{m['ece']:.4f}" if "ece" in m else "-"
+        rows.append(f"<tr><td>{m.get('trained_at_utc', '-')}</td><td><code>{m.get('git_sha', '-')}</code></td>"
+                    f"<td>{m.get('roc_auc_test', 0):.4f}</td>"
+                    f"<td>{m.get('roc_auc_cv_mean', 0):.4f} +/- {m.get('roc_auc_cv_std', 0):.4f}</td>"
+                    f"<td>{m.get('accuracy_test', 0):.4f}</td><td>{cal}</td></tr>")
 
+    comp = gate.get("champion_comparison")
+    champ_tile = (f"<b>{comp['diff']:+.4f}</b><span>AUC vs deployed model (95% CI {comp['ci'][0]:+.3f} to "
+                  f"{comp['ci'][1]:+.3f})</span>") if comp else "<b>first</b><span>no champion to compare</span>"
+    n_enforced = sum(1 for c in gate["checks"] if not c["skipped"])
     auc_series = [m.get("roc_auc_test", 0) for m in history][-40:]
+    gate_floor = next(float(c["requirement"].split()[-1]) for c in gate["checks"] if c["name"] == "roc_auc_test")
+    ci = metrics["roc_auc_test_ci"]
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -82,52 +179,65 @@ def main():
   * {{ box-sizing:border-box; margin:0; }}
   body {{ font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; color:var(--ink);
          background:#f9fafb; line-height:1.55; padding:40px 20px; }}
-  .wrap {{ max-width:900px; margin:0 auto; }}
+  .wrap {{ max-width:960px; margin:0 auto; }}
   h1 {{ font-size:1.7rem; }} .sub {{ color:var(--muted); margin:6px 0 26px; }}
   .tiles {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:14px; margin-bottom:26px; }}
   .tile {{ background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px 18px; }}
   .tile b {{ font-size:1.5rem; color:var(--brand); display:block; }}
   .tile span {{ font-size:0.8rem; color:var(--muted); }}
   .card {{ background:#fff; border:1px solid var(--line); border-radius:12px; padding:20px 22px; margin-bottom:20px; }}
+  .two {{ display:grid; grid-template-columns:auto 1fr; gap:24px; align-items:center; }}
   h2 {{ font-size:1.05rem; margin-bottom:12px; }}
-  table {{ width:100%; border-collapse:collapse; font-size:0.88rem; }}
-  th,td {{ text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }}
+  table {{ width:100%; border-collapse:collapse; font-size:0.86rem; }}
+  th,td {{ text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); }}
   th {{ color:var(--muted); font-weight:600; }}
   .ok {{ color:var(--ok); font-weight:700; }} .bad {{ color:var(--bad); font-weight:700; }}
+  .skip {{ color:var(--muted); }}
   code {{ background:#f3f4f6; padding:1px 6px; border-radius:5px; }}
   a {{ color:var(--brand); }}
   .foot {{ color:var(--muted); font-size:0.82rem; margin-top:24px; }}
+  @media (max-width:640px) {{ .two {{ grid-template-columns:1fr; }} }}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>EvalGate - Model Quality Dashboard</h1>
   <p class="sub">Published automatically by the CD pipeline after every gated deployment.
-     Latest model: <code>{metrics['git_sha']}</code> trained {metrics['trained_at_utc']} UTC.</p>
+     Latest model: <code>{metrics['git_sha']}</code> trained {metrics['trained_at_utc']} UTC.
+     <a href="model_card.md">Model card</a>.</p>
 
   <div class="tiles">
-    <div class="tile"><b>{metrics['roc_auc_test']:.4f}</b><span>Test ROC-AUC</span></div>
-    <div class="tile"><b>{metrics['roc_auc_cv_mean']:.4f}</b><span>5-fold CV ROC-AUC</span></div>
-    <div class="tile"><b>{metrics['accuracy_test']:.4f}</b><span>Test accuracy</span></div>
+    <div class="tile"><b>{metrics['roc_auc_test']:.4f}</b><span>Test ROC-AUC (95% CI {ci[0]:.3f} to {ci[1]:.3f})</span></div>
+    <div class="tile"><b>{metrics['ece']:.3f}</b><span>Calibration error (ECE)</span></div>
+    <div class="tile">{champ_tile}</div>
+    <div class="tile"><b>{n_enforced}</b><span>Release checks enforced, all passed</span></div>
     <div class="tile"><b>{len(history)}</b><span>Gated deployments recorded</span></div>
   </div>
 
   <div class="card">
-    <h2>Quality gate (enforced in CI - a failing row blocks deployment)</h2>
-    <table><tr><th>Metric</th><th>Value</th><th>Required</th><th>Gate</th></tr>{''.join(gates)}</table>
+    <h2>Release gate (enforced in CI - any FAIL blocks deployment)</h2>
+    <table><tr><th>Group</th><th>Check</th><th>Value</th><th>Required</th><th>Gate</th></tr>{check_rows(gate['checks'])}</table>
+  </div>
+
+  <div class="card two">
+    <div>{reliability_svg(metrics['reliability'])}</div>
+    <div><h2>Calibration</h2><p>Each dot is a bin of customers: the model's average predicted churn
+      probability against the share who actually churned. On the dashed diagonal, a predicted 30% means
+      30% churn. ECE {metrics['ece']:.4f}, Brier {metrics['brier']:.4f}.</p></div>
   </div>
 
   <div class="card">
     <h2>Test ROC-AUC across deployments</h2>
-    {spark_svg(auc_series)}
+    {spark_svg(auc_series, gate_floor)}
   </div>
 
   <div class="card">
     <h2>Deployment history</h2>
-    <table><tr><th>Trained (UTC)</th><th>Commit</th><th>Test AUC</th><th>CV AUC</th><th>Accuracy</th></tr>{''.join(rows)}</table>
+    <table><tr><th>Trained (UTC)</th><th>Commit</th><th>Test AUC</th><th>CV AUC</th><th>Accuracy</th><th>ECE</th></tr>{''.join(rows)}</table>
   </div>
 
-  <p class="foot">Pipeline: push -> tests -> train -> quality gate -> artifact -> deploy.
+  <p class="foot">Pipeline: push -> tests -> train -> release gate -> artifact -> deploy. Policy in
+     <a href="https://github.com/PSPMANI/evalgate/blob/main/gate.toml">gate.toml</a>.
      Source: <a href="https://github.com/PSPMANI/evalgate">github.com/PSPMANI/evalgate</a> |
      By <a href="https://pspmani.github.io">Pathi Manikanta</a></p>
 </div>
@@ -137,7 +247,9 @@ def main():
     SITE.mkdir(exist_ok=True)
     (SITE / "index.html").write_text(html, encoding="utf-8")
     (SITE / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    print(f"site/ built: {len(history)} history entries")
+    (SITE / "model_card.md").write_text(model_card(metrics, gate, len(history)), encoding="utf-8")
+    (SITE / "champion.json").write_text(json.dumps(predictions), encoding="utf-8")
+    print(f"site/ built: {len(history)} history entries, model card, champion baseline")
 
 
 if __name__ == "__main__":

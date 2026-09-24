@@ -1,0 +1,28 @@
+# EvalGate release policy. Every rule here can block a deployment.
+# Thresholds were set from principle before looking at slice results, and are not
+# tuned to make the current model pass.
+
+[thresholds]
+roc_auc_test = 0.82        # held-out discrimination floor
+accuracy_test = 0.75
+roc_auc_cv_mean = 0.82
+max_cv_test_gap = 0.03     # CV and held-out disagreeing = leakage or overfit smell
+
+[calibration]
+max_ece = 0.05             # expected calibration error, 10 bins
+max_brier = 0.16
+
+[slices]
+columns = ["gender", "SeniorCitizen", "Contract", "tenure_band", "InternetService"]
+min_slice_n = 100          # smaller slices are reported but not gated (too noisy)
+min_slice_auc = 0.65       # no customer segment may fall below this
+fairness_columns = ["gender", "SeniorCitizen"]
+max_fairness_gap = 0.08    # max AUC gap between groups of a fairness column
+
+[champion]
+non_inferiority_margin = 0.01   # block if the lower 95% bound of (new - deployed) AUC < -0.01
+n_boot = 1000
+
+[drift]
+psi_warn = 0.10
+psi_block = 0.25           # significant shift in any feature blocks the batch
